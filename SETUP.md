@@ -14,7 +14,7 @@ and change them to fit YOU:
 
 - **Tickers:** `WATCHLIST` in tradebot.py and `my_tickers` in newswatch.py
 - **Rules and trading window:** `RULES`, `TRADE_DAYS` and `DAY_START` in tradebot.py
-  (the default is: Mon and Tue start at 11 AM Central, Wed-Fri all day, flat by Friday, long calls and puts only)
+  (the default is: Mon and Tue start at 11 AM Central, Wed-Fri start at 9 AM, flat by Friday, long calls and puts only)
 - **Stops and targets:** `STOP`, `TARGETS` and `SOFT` in tradebot.py (-20%, +20%/+40%, +/-10%)
 - **Position size:** set with `balance` and the cash/slots settings (default 50% cash, 2 positions)
 - **Fees:** `FEE_PER_CONTRACT` in tradebot.py ($0.65 each way is a Fidelity-style number)

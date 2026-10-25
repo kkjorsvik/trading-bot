@@ -136,7 +136,7 @@ def now():
     return datetime.now(TZ)
 
 
-CHECKINS = [(8, 0, "8 AM"), (12, 0, "Noon"), (15, 0, "3 PM"), (20, 0, "8 PM")]
+CHECKINS = [(6, 0, "6 AM"), (8, 0, "8 AM"), (12, 0, "Noon"), (15, 0, "3 PM")]  # night digest v1: no 8 PM, added 6 AM
 
 
 def _hdr(text):
@@ -149,7 +149,41 @@ def _hdr(text):
         return "=?UTF-8?B?" + base64.b64encode(text.encode("utf-8")).decode("ascii") + "?="
 
 
-def alert(msg, title, priority=3, tags=None, now_please=False):
+# alert buttons v1
+_PHONE_BASE = None
+
+
+def _phone_base():
+    """Address your phone can reach ntfy at (Tailscale). Set NTFY_PHONE_URL to override."""
+    global _PHONE_BASE
+    if _PHONE_BASE is not None:
+        return _PHONE_BASE or None
+    url = os.environ.get("NTFY_PHONE_URL", "").strip().rstrip("/")
+    if not url:
+        try:
+            import subprocess
+            ip = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
+            url = f"http://{ip[0]}:2586" if ip else ""
+        except Exception as e:
+            print(f"[buttons] no tailscale ip: {e}")
+            url = ""
+    _PHONE_BASE = url
+    return url or None
+
+
+def check_actions(t, cp="C"):
+    """ntfy buttons that send a command to the bot, so nothing has to be typed."""
+    base = _phone_base()
+    if not base:
+        return None
+    side = " put" if cp == "P" else ""
+    parts = [f"http, Check 1, {base}/trade, method=POST, body=check {t} 1{side}",
+             f"http, Check 2, {base}/trade, method=POST, body=check {t} 2{side}",
+             f"http, Live, {base}/trade, method=POST, body=live {t}"]
+    return "; ".join(parts)
+
+
+def alert(msg, title, priority=3, tags=None, now_please=False, actions=None):
     if priority < 5 and not now_please and not TEST:
         lines = [l for l in msg.split("\n") if l and not l.startswith(("Data:", "Track record: building"))]
         digest_add(title + "\n" + "\n".join("   " + l for l in lines[:6]))
@@ -160,6 +194,8 @@ def alert(msg, title, priority=3, tags=None, now_please=False):
     h = {"Title": _hdr(title), "Priority": str(priority)}
     if tags:
         h["Tags"] = tags
+    if actions:
+        h["Actions"] = actions
     try:
         requests.post(NTFY, data=msg.encode("utf-8"), headers=h, timeout=10)
     except Exception as e:
@@ -273,8 +309,42 @@ def strip_tags(s):
     return html.unescape(re.sub(r"<[^>]+>", " ", s or "")).strip()
 
 
+# news age v1
+MAX_NEWS_AGE_H = 12   # a headline published longer ago than this is not "news" any more
+
+
+def _parse_dt(txt):
+    from datetime import timezone
+    from email.utils import parsedate_to_datetime
+    txt = (txt or "").strip()
+    if not txt:
+        return None
+    try:
+        dt = parsedate_to_datetime(txt)
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _age_hours(item):
+    from datetime import timezone
+    dt = _parse_dt(item.get("published"))
+    if not dt:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600)
+
+
+def _age_txt(h):
+    return f"published {h * 60:.0f} min ago" if h < 1 else f"published {h:.0f}h ago"
+
+
 def parse_feed(raw):
-    """RSS 2.0 or Atom -> list of {title, summary, link}."""
+    """RSS 2.0 or Atom -> list of {title, summary, link, published}."""
     root = ET.fromstring(raw)
     items = []
     for it in root.iter():
@@ -290,6 +360,11 @@ def parse_feed(raw):
                 d["summary"] = strip_tags(ch.text)[:600]
             elif t == "link":
                 d["link"] = ch.attrib.get("href") or (ch.text or "").strip()
+            elif t in ("published", "pubDate", "updated", "date") and ch.text:
+                rank = {"published": 3, "pubDate": 3, "date": 2, "updated": 1}[t]
+                if rank > d.get("_rank", 0) and _parse_dt(ch.text):
+                    d["published"], d["_rank"] = ch.text.strip(), rank
+        d.pop("_rank", None)
         if d.get("title"):
             items.append(d)
     return items
@@ -702,6 +777,8 @@ def handle(item):
     if chg is not None:
         react = f" | today {chg:+.1%}" + (f", volume {volx:.1f}x" if volx else "")
     line = f"{info['summary']}\n{t} {px}{react} | mkt cap {money(mcap)} | {item['source']}"
+    if item.get("age_h") is not None:
+        line += " | " + _age_txt(item["age_h"])
     hist = history_line(ev)
     short = f"{t} {EVENT_LABEL[ev]}: {info['summary'][:90]}"
 
@@ -753,8 +830,9 @@ def handle(item):
             if strength == 3:
                 why.append("major news")
             head = "\nYou HOLD this - consider your exit." if held else ""
-            alert(line + head + "\nPut signal: " + "; ".join(why) + earnings_line(t) + contract_text(t, cp="P") + "\n" + hist,
-                  title=f"\U0001F53B PUT SIGNAL {t}: {EVENT_LABEL[ev]}", priority=5, tags="chart_with_downwards_trend")
+            alert_signal(line + head + "\nPut signal: " + "; ".join(why) + earnings_line(t) + contract_text(t, cp="P") + "\n" + hist,
+                  title=f"\U0001F53B PUT SIGNAL {t}: {EVENT_LABEL[ev]}", priority=5, tags="chart_with_downwards_trend",
+                  actions=check_actions(t, "P"))
             record_signal(t, ev, "P")
             return
         if held or watched:
@@ -783,8 +861,9 @@ def handle(item):
             if held or watched:
                 why.append("you hold/watch it")
             pp = paper_open(t, ev)
-            alert(line + "\nBuy signal: " + "; ".join(why) + earnings_line(t) + pp + contract_text(t) + "\n" + hist,
-                  title=f"\U0001F525 BUY SIGNAL {t}: {EVENT_LABEL[ev]}", priority=5, tags="fire")
+            alert_signal(line + "\nBuy signal: " + "; ".join(why) + earnings_line(t) + pp + contract_text(t) + "\n" + hist,
+                  title=f"\U0001F525 BUY SIGNAL {t}: {EVENT_LABEL[ev]}", priority=5, tags="fire",
+                  actions=check_actions(t))
             record_signal(t, ev)
         elif strength >= 2 or proven or held or watched:
             note = "\nAlready up a lot today - careful chasing." if hot else ""
@@ -795,6 +874,33 @@ def handle(item):
             digest_add(f"+ {short}")
 
 
+# quiet signals v1
+# night digest v1
+def _quiet_now():
+    """True before 9:00 AM CT or whenever the market is closed: signals then are watch-only."""
+    n = now()
+    return (not is_open_now(n)) or n.time() < dtime(9, 0)
+
+
+def _silent_now(n):
+    """8 PM to 6 AM, weekends and holidays: signals are held for the next check-in, not pushed."""
+    return n.time() >= dtime(20, 0) or n.time() < dtime(6, 0) or not market_day(n.date())["open"]
+
+
+def alert_signal(msg, title, priority=5, tags=None, actions=None):
+    if _silent_now(now()):
+        mark = "-" if "PUT SIGNAL" in title else "+"
+        digest_add(f"{mark} OVERNIGHT: {title} - {msg.split(chr(10))[0][:140]}")
+        return
+    if _quiet_now():
+        why = "The market is closed." if not is_open_now(now()) else "The first 30 minutes after the open are too volatile."
+        msg = (f"WATCH ONLY, NOT A BUY YET. {why} Re-check after 9:00 AM CT: tap Check 1 or 2 "
+               "and see if the stock is still moving this way.\n\n" + msg)
+        alert(msg, "WATCH: " + title, priority=4, tags=tags, now_please=True, actions=actions)
+    else:
+        alert(msg, title, priority=priority, tags=tags, actions=actions)
+
+
 def record_signal(t, ev, side="C"):
     try:
         path = os.path.join(HERE, "buy_signals.json")
@@ -803,7 +909,8 @@ def record_signal(t, ev, side="C"):
                 sigs = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             sigs = []
-        sigs.append({"time": now().isoformat(timespec="seconds"), "ticker": t, "event": ev, "side": side})
+        sigs.append({"time": now().isoformat(timespec="seconds"), "ticker": t, "event": ev, "side": side,
+                     "quiet": _quiet_now()})
         with open(path, "w") as f:
             json.dump(sigs[-200:], f)
     except Exception as e:
@@ -834,6 +941,11 @@ def scan():
             continue
         seen_set.add(key)
         seen.append(key)
+        age = _age_hours(item)
+        if age is not None and age > MAX_NEWS_AGE_H:
+            print(f"[stale] {age:.0f}h old, skipped: {item['title']}")
+            continue
+        item["age_h"] = age
         new += 1
         try:
             handle(item)
@@ -899,7 +1011,8 @@ def check_activity():
                 pp = paper_open(t, "unusual_activity")
                 alert("\n".join(msgs) + f"\nOn watch since {w['added'][:10]}: {w['reason']}.\n"
                       "Buy signal: unusual buying on a takeover-watch stock. Look now." + earnings_line(t) + pp,
-                      title=f"\U0001F525 BUY SIGNAL {t}: unusual activity", priority=5, tags="fire")
+                      title=f"\U0001F525 BUY SIGNAL {t}: unusual activity", priority=5, tags="fire",
+                      actions=check_actions(t))
             else:
                 alert("\n".join(msgs) + f"\nOn watch since {w['added'][:10]}: {w['reason']}.",
                       title=f"\U0001F6A8 {t}: unusual activity", priority=3)
@@ -1248,6 +1361,12 @@ def main():
             slot = f"{n.date()}-{hh}"
             if dtime(hh, mm) <= n.time() < dtime(hh, 59) and slot not in sent_checkins:
                 sent_checkins.add(slot)
+                if label in ("6 AM", "8 AM"):
+                    try:
+                        scan()
+                        last_scan = time.time()
+                    except Exception:
+                        traceback.print_exc()
                 try:
                     check_in(label)
                 except Exception:

@@ -48,7 +48,7 @@ MIN_DTE = 9                # rule: days to expiry at entry
 NVDA_MAX_EXT10 = 0.02      # pullback zone: <= 2% above 10-day avg
 NVDA_MAX_RSI = 60          # ...and RSI(14) under 60
 TRADE_DAYS = {0, 1, 2, 3, 4}  # Mon-Fri (Mon = 0)  # puts+monday v1
-DAY_START = {0: dtime(11, 0), 1: dtime(11, 0)}  # Mon and Tue start at 11:00
+DAY_START = {0: dtime(11, 0), 1: dtime(11, 0), 2: dtime(9, 0), 3: dtime(9, 0), 4: dtime(9, 0)}  # quiet v1: Mon/Tue 11:00, other days 9:00 (the open is too volatile)
 HOT_DAYS = {2, 3, 4}       # the 12-for-12 SPY setup was Wed-Fri
 
 
@@ -61,7 +61,7 @@ def window_msg(n):
     if not md["open"] and n.weekday() < 5:
         return f"Market closed today ({md['name']})."
     if n.weekday() in DAY_START and n.time() < DAY_START[n.weekday()]:
-        return f"{n:%A} trading opens at 11:00."
+        return f"{n:%A} trading opens at {DAY_START[n.weekday()].strftime('%H:%M').lstrip('0')}."
     return "Weekend - market's closed." if n.weekday() > 4 else "Outside your trading window."
 
 WATCHLIST = {"SPY", "NVDA", "AAPL", "SOFI", "HOOD"}
@@ -90,8 +90,10 @@ def _hdr(text):
         return "=?UTF-8?B?" + base64.b64encode(text.encode("utf-8")).decode("ascii") + "?="
 
 
-def send(topic, msg, title=None, priority=3, tags=None):
+def send(topic, msg, title=None, priority=3, tags=None, actions=None):
     headers = {"Priority": str(priority)}
+    if actions:
+        headers["Actions"] = actions
     if title:
         headers["Title"] = _hdr(title)
     if tags:
@@ -106,8 +108,8 @@ def reply(msg):
     send(CMD_TOPIC, msg, title=BOT_TITLE, priority=3)
 
 
-def alert(msg, title, priority, tags=None):
-    send(ALERT_TOPIC, msg, title=title, priority=priority, tags=tags)
+def alert(msg, title, priority, tags=None, actions=None):
+    send(ALERT_TOPIC, msg, title=title, priority=priority, tags=tags, actions=actions)
 
 
 # ---------------------------------------------------------------- storage
@@ -290,7 +292,7 @@ HOT_MAX_SPREAD = 0.05    # skip contracts with bid/ask spread over 5%
 HOT_MIN_OI = 500         # skip thinly traded strikes
 
 
-def spy_hot(n=None):
+def _spy_hot_base(n=None):
     n = n or now()
     if not can_trade(n):
         return False, window_msg(n)
@@ -299,6 +301,57 @@ def spy_hot(n=None):
     if n.weekday() == 4 and n.time() >= dtime(13, 0):
         return False, "Too late Friday - no time to work before the close."
     return True, "Wed-Fri, 9-14 days out, out by Friday. Your setup went 12 for 12."
+
+
+# spy trend v1
+HOT_MIN_DAY = -0.002    # SPY below yesterday's close by more than this -> not hot
+HOT_MIN_NOW = -0.003    # down this much since the open, or over the last hour -> not hot
+_SPY_TREND = {"t": 0.0, "d": None}
+
+
+def _spy_trend():
+    if _SPY_TREND["d"] is not None and time.time() - _SPY_TREND["t"] < 60:
+        return _SPY_TREND["d"]
+    import alpaca_live
+    d = alpaca_live.trend(["SPY"]).get("SPY")
+    _SPY_TREND.update(t=time.time(), d=d)
+    return d
+
+
+def spy_hot(n=None):
+    n = n or now()
+    ok, why = _spy_hot_base(n)
+    if not ok:
+        return ok, why
+    try:
+        d = _spy_trend()
+    except Exception as e:
+        print(f"[spy] trend: {e}")
+        return ok, why + " (couldn't read today's SPY trend, check it yourself)"
+    if not d:
+        return ok, why + " (no SPY trend data yet today)"
+    live = market_open(n)
+    day = d.get("day")
+    opn = d.get("open") if live else None
+    m60 = d.get("m60") if live else None
+    bits = []
+    if day is not None:
+        bits.append(f"{day:+.1%} vs yesterday's close" + ("" if live else " (pre-market)"))
+    if opn is not None:
+        bits.append(f"{opn:+.1%} since the open")
+    if m60 is not None:
+        bits.append(f"{m60:+.1%} in the last hour")
+    now_txt = "SPY today: " + ", ".join(bits) + "." if bits else ""
+    bad = []
+    if day is not None and day < HOT_MIN_DAY:
+        bad.append("SPY is below yesterday's close")
+    if opn is not None and opn < HOT_MIN_NOW:
+        bad.append("it's falling since the open")
+    if m60 is not None and m60 < HOT_MIN_NOW:
+        bad.append("it's dropping over the last hour")
+    if bad:
+        return False, "Not now: " + "; ".join(bad) + f". {now_txt} The day of the week fits, but the market isn't cooperating."
+    return True, why + " " + now_txt
 
 
 def spy_picks(top=3):
@@ -779,7 +832,11 @@ def load_account():
             a = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         a = {}
-    return {"balance": a.get("balance"), "cash_pct": a.get("cash_pct", 0.5), "slots": a.get("slots", 2)}
+    # trade pct v1
+    cash, slots = a.get("cash_pct", 0.5), a.get("slots", 2)
+    tp = a.get("trade_pct") or (1 - cash) / slots
+    return {"balance": a.get("balance"), "cash_pct": cash, "slots": slots, "trade_pct": tp,
+            "restricted_until": a.get("restricted_until")}
 
 
 def save_account(a):
@@ -793,7 +850,7 @@ def auto_budget():
     a = load_account()
     if not a["balance"]:
         return None
-    b = a["balance"] * (1 - a["cash_pct"]) / a["slots"]
+    b = a["balance"] * a["trade_pct"]
     try:
         sc = settled_cash()
         if sc is not None:
@@ -815,16 +872,27 @@ def sizing_line():
     b = auto_budget()
     if not b:
         return ""
-    return (f"\nBudget per trade: ${b:,.0f} (balance ${a['balance']:,.0f}, "
-            f"{a['cash_pct']:.0%} in cash, {a['slots']} positions max)")
+    line = f"\nBudget per trade: ${b:,.0f} = {a['trade_pct']:.0%} of your ${a['balance']:,.0f} balance"
+    if b < round(a["balance"] * a["trade_pct"], -1) - 5:
+        line += " (cut down because that's all the settled cash you have right now)"
+    return line + "\nChange it with: balance pct 25"
 
 
 def cmd_balance(words):
     a = load_account()
-    if words and words[0].lower() in ("cash", "slots"):
+    if words and words[0].lower() in ("pct", "percent", "trade"):
+        if len(words) < 2:
+            raise ValueError("like: balance pct 25   (25% of your account per trade)")
+        v = float(words[1].replace("%", ""))
+        v = v / 100 if v > 1 else v
+        if not 0 < v <= 1:
+            raise ValueError("percent should be between 1 and 100")
+        a["trade_pct"] = v
+    elif words and words[0].lower() in ("cash", "slots"):
         if len(words) < 2:
             raise ValueError("like: balance cash 50   or   balance slots 2")
         v = float(words[1].replace("%", ""))
+        a.pop("trade_pct", None)
         if words[0].lower() == "cash":
             a["cash_pct"] = v / 100 if v > 1 else v
         else:
@@ -849,12 +917,16 @@ nvda    - NVDA buy / don't buy
 spy     - hot buy check + best contracts
 pick AAPL - the specific call to buy (strike, date, size, stop)
 spy 2500 - same, sized to your budget (plain 'spy' uses your balance)
-balance 4500 - set balance; 'balance cash 50', 'balance slots 2'
+balance 4500 - set balance; 'balance pct 25' = 25% of account per trade
 rules   - the rulebook
 cash    - settled cash you can use now and what settles when
 stats   - profit/loss, win rate, profit factor, worst streak and drop
 scorecard - this week: rule-following vs rule-breaking P&L
 news    - recent news hits (news NVDA)
+dip     - preview the 'market is down, buy SPY?' alert
+restricted from 10/23 - set the 90-day settled-cash-only restriction (also: until 1/21, off)
+hold SPY - mark a SPY position as a 3-day dip hold (skips Friday get-flat)
+check   - pre-trade check, logs nothing: check LLY 1 (pick #1 or #2; add put, or x3), or paste a Buy to Open order
 signal LLY - is the 🔥/🔻 signal still strong, fading or gone
 scoreboard - which news types actually moved stocks
 watch   - deal watch list (watch add XYZ / watch drop XYZ)
@@ -887,6 +959,9 @@ def cmd_buy(words):
     pid = pid_of(t["ticker"], t["strike"], t["cp"], exp)
     warnings = rule_warnings(t, n)
     warnings += cash_warning(t)
+    _rt = restriction_text()
+    if _rt:
+        warnings.append(_rt)
     with lock:
         pos = load_positions()
         existing = [p for p in pos if p["id"] == pid]
@@ -907,6 +982,11 @@ def cmd_buy(words):
                  "stop_last": None, "targets_hit": [], "expiry_warned": None}
             pos.append(p)
             note = f"Logged: {pid} x{t['qty']} @ {t['price']:.2f}"
+            if t["ticker"] == "SPY" and t["cp"] == "C" and _dip_alert_today(n):
+                p["hold_until"] = _add_trading_days(n.date(), 3).isoformat()
+                _hu = date.fromisoformat(p["hold_until"])
+                note += (f"\nDip trade: hold until at least {_hu.strftime('%a')} {_hu.month}/{_hu.day}. "
+                         "The Friday get-flat reminder is skipped until then.")
         save_positions(pos)
         log_trade("buy", pid, t["qty"], t["price"])
         log_rules(pid, warnings)
@@ -1073,13 +1153,15 @@ def cmd_news_verdicts(words):
     out.sort(key=lambda x: -x[0])
     good = sum(1 for o in out if o[2] in ("GOOD", "BUY SIGNAL"))
     bad = sum(1 for o in out if o[2] in ("BAD", "PUT SIGNAL"))
-    lines = [f"Last 3 days: {good} good, {bad} bad, {len(out) - good - bad} mixed/neutral"]
+    lines = [f"Last 3 days: {good} good, {bad} bad, {len(out) - good - bad} mixed/neutral"]  # no legend v1
+    hot = [o for o in out if o[2] in ("BUY SIGNAL", "PUT SIGNAL")]
+    lines.append("Buy/put signals: " + (", ".join(f"{o[3]} {o[1]}" for o in hot) if hot else "none"))
     for _, t, verdict, icon, top, n in out[:8]:
         more = f" (+{n - 1} more)" if n > 1 else ""
         lines.append(f"{icon} {t} - {verdict}: {top['event'].replace('_', ' ')}{more} ({_nd(top)})")
         lines.append(f"   {top['title'][:80]}")
         lines.append(f"   {_history(rows, top['event'])}")
-    lines.append("\U0001F525 = the bot fired a buy signal. \U0001F53B = it fired a put signal. 'news NVDA' = one stock.")
+    lines.append("'news NVDA' = one stock.")
     reply("\n".join(lines))
 
 
@@ -1106,6 +1188,9 @@ def cmd_pick(words):
         eb = next_earnings(t, now().date())
         if eb and 0 <= (eb - now().date()).days <= 21:
             notes.append(f"\nEarnings {eb.month}/{eb.day} - options get repriced after.")
+            _el = earnings_followthrough_line(t)
+            if _el:
+                notes.append("\n" + _el)
     except Exception:
         pass
     if not can_trade(now()):
@@ -1238,11 +1323,14 @@ def cmd_cash(_):
         lines.append(f"  ${i['amount']:,.0f} from a sale settles {d.strftime('%a')} {d.month}/{d.day}")
     if not st["unsettled"]:
         lines.append("Everything is settled.")
+    _rt = restriction_text()
+    if _rt:
+        lines.append(_rt)
     reply("\n".join(lines))
 
 
 COMMANDS = {"buy": cmd_buy, "sell": cmd_sell, "drop": cmd_drop, "list": cmd_list,
-            "status": cmd_list, "cash": cmd_cash, "stats": cmd_stats, "pick": cmd_pick, "live": lambda w: cmd_live(w), "signal": lambda w: cmd_signal(w), "balance": cmd_balance, "scorecard": cmd_scorecard, "scoreboard": cmd_scoreboard, "news": cmd_news_verdicts, "nvda": cmd_nvda, "spy": cmd_spy, "watch": cmd_watch, "congress": cmd_congress,
+            "status": cmd_list, "cash": cmd_cash, "stats": cmd_stats, "pick": cmd_pick, "live": lambda w: cmd_live(w), "signal": lambda w: cmd_signal(w), "restricted": lambda w: cmd_restricted(w), "hold": lambda w: cmd_hold(w), "dip": lambda w: cmd_dip(w), "balance": cmd_balance, "scorecard": cmd_scorecard, "scoreboard": cmd_scoreboard, "news": cmd_news_verdicts, "nvda": cmd_nvda, "spy": cmd_spy, "watch": cmd_watch, "congress": cmd_congress,
             "rules": lambda _: reply(RULES), "help": lambda _: reply(HELP)}
 
 
@@ -1276,6 +1364,15 @@ def parse_fidelity(text):
 
 
 def handle(text):
+    if re.match(r"\s*check\b", text, re.I):
+        try:
+            cmd_check(text)
+        except ValueError as e:
+            reply(f"Couldn't check that: {e}")
+        except Exception as e:
+            traceback.print_exc()
+            reply(f"Check failed: {e}")
+        return
     try:
         fid = parse_fidelity(text)
     except ValueError as e:
@@ -1514,6 +1611,536 @@ def cmd_signal(words):
     reply("\n\n".join(out))
 
 
+# pretrade check v1
+def _check_parse(text):
+    body = re.sub(r"^\s*check\b", "", text, flags=re.I).strip()
+    # check shortcut v1
+    toks = body.replace(",", " ").split()
+    if not toks:
+        raise ValueError("like: check LLY 1   (1 or 2 = the numbered pick; add put, or x3 for quantity)")
+    if len(toks) >= 2 and toks[0].replace(".", "").isalpha() and toks[1] in ("1", "2"):
+        from market_extras import contract_options
+        tk, k, cp, qty = toks[0].upper(), int(toks[1]) - 1, "C", None
+        for w in toks[2:]:
+            wl = w.lower()
+            if wl in ("put", "puts", "p"):
+                cp = "P"
+            elif wl in ("call", "calls", "c"):
+                cp = "C"
+            elif re.fullmatch(r"x?\d+", wl):
+                qty = int(wl.lstrip("x"))
+            else:
+                raise ValueError(f"didn't understand '{w}'")
+        spot, exp, rows = contract_options(tk, now().date(), cp=cp)
+        if k >= len(rows):
+            raise ValueError(f"no pick #{k + 1} for {tk} right now (the bot found {len(rows)} liquid {'puts' if cp == 'P' else 'calls'}).")
+        r = rows[k]
+        price = round(r["mid"], 2)
+        if qty is None:
+            a = load_account()
+            bal = a.get("balance") if a else None
+            qty = max(1, int(bal * a["trade_pct"] // (price * 100))) if bal else 1
+        return {"ticker": tk, "strike": float(r["strike"]), "cp": cp, "expiry": exp, "qty": qty, "price": price}
+    m = FID_RE.search(body)
+    if m:
+        side, oc, qty, tk, mon, day, yr, strike, cp = m.groups()
+        if (side.lower(), oc.lower()) != ("buy", "open"):
+            raise ValueError("check is for Buy to Open orders, before you buy.")
+        mo = MONTHS.get(mon.lower())
+        if not mo:
+            raise ValueError(f"didn't understand the month '{mon}'")
+        px = FID_PRICE.findall(body)
+        return {"ticker": tk.upper(), "strike": float(strike.replace(",", "")), "cp": cp[0].upper(),
+                "expiry": date(int(yr), mo, int(day)).isoformat(), "qty": int(qty),
+                "price": float(px[-1]) if px else None}
+    t = parse_trade(body.replace(",", "").split(), now().date())
+    t["qty"] = t["qty"] or 1
+    if t["expiry"] is not None and not isinstance(t["expiry"], str):
+        t["expiry"] = t["expiry"].isoformat()
+    return t
+
+
+def check_text(text):
+    t = _check_parse(text)
+    if not t["price"]:
+        raise ValueError("no price. Paste the order with its limit, or add @61.64")
+    if not t["expiry"] or not t["cp"]:
+        raise ValueError("need the full contract, like: check ASML 1680C 11/6 x1 @61.64")
+    n = now()
+    tk, cp, qty = t["ticker"], t["cp"], t["qty"]
+    sign = 1 if cp == "C" else -1
+    cost = qty * t["price"] * 100 + FEE_PER_CONTRACT * qty
+    flags = []  # (2 = stop, 1 = caution, text)
+
+    a = load_account()
+    bal = a.get("balance") if a else None
+    if bal:
+        budget = bal * a["trade_pct"]
+        fits = int(budget // (t["price"] * 100))
+        buys = f"Your limit buys {fits} at this price." if fits else "Even 1 contract is over your limit."
+        if cost > budget * 1.25:
+            flags.append((2, f"SIZE: ${cost:,.0f} is {cost / bal:.0%} of your ${bal:,.0f} account. Your {a['trade_pct']:.0%} limit is about ${budget:,.0f}. {buys}"))
+        elif cost > budget:
+            flags.append((1, f"SIZE: ${cost:,.0f} is a bit over your ${budget:,.0f} limit ({cost / bal:.0%} of account). {buys}"))
+    try:
+        for w in cash_warning(t):
+            flags.append((2, w.replace("Cash check: ", "CASH: ")))
+    except Exception as e:
+        print(f"[check] cash: {e}")
+
+    rule_lines = []
+    try:
+        rule_lines = rule_warnings(t, n)
+    except Exception as e:
+        print(f"[check] rules: {e}")
+    try:
+        _win = window_msg(n) if not can_trade(n) else None
+    except Exception:
+        _win = None
+    if _win:
+        flags.append((2, "WINDOW: " + _win + " No buying before 9:00 AM CT, the open is too volatile."))
+    _rt = restriction_text()
+    if _rt:
+        flags.append((1, _rt))
+    flags += [(1, "RULE: " + w) for w in rule_lines if w != _win]
+    rules_txt = " ".join(rule_lines)
+
+    bid = ask = oi = None
+    try:
+        import alpaca_live
+        q = alpaca_live.option_quote(tk, t["expiry"], t["strike"], cp)
+        if q and q["bid"] > 0 and q["ask"] > 0:
+            bid, ask = q["bid"], q["ask"]
+    except Exception as e:
+        print(f"[check] alpaca option: {e}")
+    try:
+        import yfinance as yf
+        from market_extras import _nz
+        ch = yf.Ticker(tk).option_chain(t["expiry"])
+        df = ch.calls if cp == "C" else ch.puts
+        row = df[(df["strike"] - float(t["strike"])).abs() < 1e-6]
+        if not row.empty:
+            r = row.iloc[0]
+            oi = int(_nz(r.get("openInterest")))
+            if bid is None and _nz(r.get("bid")) > 0 and _nz(r.get("ask")) > 0:
+                bid, ask = _nz(r.get("bid")), _nz(r.get("ask"))
+    except Exception as e:
+        print(f"[check] chain: {e}")
+    if oi is not None and "thin options" not in rules_txt:
+        if oi < 250:
+            flags.append((2, f"THIN: only {oi} open contracts. Hard to sell at a fair price."))
+        elif oi < 500:
+            flags.append((1, f"LIGHT: {oi} open contracts. Spreads can be wide."))
+    if bid and ask:
+        mid = (bid + ask) / 2
+        spread = (ask - bid) / mid
+        if "wide bid/ask" not in rules_txt:
+            if spread > 0.15:
+                flags.append((2, f"SPREAD: bid {bid:.2f} / ask {ask:.2f} is a {spread:.0%} gap. You lose that just getting in and out."))
+            elif spread > 0.05:
+                flags.append((1, f"SPREAD: bid {bid:.2f} / ask {ask:.2f} ({spread:.0%} gap)."))
+        over = (t["price"] - mid) * 100 * qty
+        if over > max(0.01 * cost, 5):
+            flags.append((1, f"PRICE: your {t['price']:.2f} is ${over:,.0f} above the middle ({mid:.2f}). Try a lower limit."))
+
+    _px_now = None
+    try:
+        import alpaca_live
+        d = alpaca_live.trend([tk]).get(tk)
+        _px_now = (d or {}).get("price")
+        if d:
+            word = "up" if cp == "C" else "down"
+            day, m60 = d.get("day"), d.get("m60")
+            if day is not None:
+                if day * sign >= 0.05:
+                    flags.append((2, f"CHASE: {tk} is already {word} {abs(day):.1%} today. Much of the move may be gone."))
+                elif day * sign >= 0.03:
+                    flags.append((1, f"CHASE: {tk} is already {word} {abs(day):.1%} today."))
+                elif day * sign <= -0.01:
+                    flags.append((1, f"AGAINST: {tk} is moving the other way today ({day:+.1%})."))
+            if m60 is not None and m60 * sign >= 0.02:
+                flags.append((1, f"SPIKE: {abs(m60):.1%} {word} in the last hour. You may be buying the top."))
+    except Exception as e:
+        print(f"[check] trend: {e}")
+
+    if not any(f[1].startswith("CHASE:") for f in flags):
+        try:
+            rr = _recent_run(tk, _px_now, sign)
+            if rr:
+                mv, refd = rr
+                word = "up" if mv > 0 else "down"
+                msg = (f"RUN: {tk} is already {word} {abs(mv):.1%} from {refd.strftime('%A')}'s close "
+                       "(last 3 sessions). The move may already be priced in.")
+                if abs(mv) >= RUN_STOP:
+                    flags.append((2, msg))
+                elif abs(mv) >= RUN_CAUTION:
+                    flags.append((1, msg))
+        except Exception as e:
+            print(f"[check] recent run: {e}")
+    try:
+        od = _opt_day(tk, t["expiry"], t["strike"], cp)
+        if od is None:
+            flags.append((1, "OPTION MOVE: couldn't read this option's move today, so check its day change yourself."))
+        else:
+            up = t["price"] / od["ref"] - 1
+            base = "yesterday's close" if od["prev"] else "today's open"
+            if up >= OPT_CHASE_STOP:
+                flags.append((2, f"LATE: this option is already up {up:.0%} from {base} ({od['ref']:.2f} to {t['price']:.2f}). You'd be buying after the pop."))
+            elif up >= OPT_CHASE_CAUTION:
+                flags.append((1, f"LATE: this option is already up {up:.0%} from {base} ({od['ref']:.2f} to {t['price']:.2f})."))
+            if od["high"] and od["low"] and od["high"] > od["low"] * 1.3 and t["price"] >= od["high"] * 0.9:
+                flags.append((1, f"PEAK: it ran {od['low']:.2f} to {od['high']:.2f} today and you're paying near the high."))
+    except Exception as e:
+        print(f"[check] option move: {e}")
+        flags.append((1, "OPTION MOVE: couldn't read this option's move today, so check its day change yourself."))
+
+    try:
+        with open(os.path.join(HERE, "buy_signals.json")) as f:
+            sigs = [x for x in json.load(f) if x.get("ticker") == tk and x.get("side", "C") == cp]
+    except (FileNotFoundError, json.JSONDecodeError):
+        sigs = []
+    if not sigs:
+        flags.append((1, f"NO SIGNAL: the bot hasn't flagged {tk} lately. This is your own idea, not a bot signal."))
+    else:
+        when = datetime.fromisoformat(sigs[-1]["time"])
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=n.tzinfo)
+        when = when.astimezone(n.tzinfo)
+        ref = when
+        if sigs[-1].get("quiet"):
+            open9 = n.replace(hour=9, minute=0, second=0, microsecond=0)
+            if when < open9 <= n:
+                ref = open9
+            flags.append((1, f"OVERNIGHT: this signal fired at {when.strftime('%-I:%M %p')} CT, before the market was open for you. "
+                             "Make sure the stock is still moving this way now (see CHASE and AGAINST)."))
+        mins = int((n - ref).total_seconds() // 60)
+        age = f"{mins} min" if mins < 90 else (f"{mins // 60} hr" if mins < 2880 else f"{mins // 1440} days")
+        if mins > 60:
+            flags.append((1, f"STALE: the signal fired {age} ago. The move may already be over."))
+    if can_trade(n) and not market_open(n):
+        flags.append((1, "CLOSED: the market is closed right now, so these prices are old."))
+
+    flags.sort(key=lambda f: -f[0])
+    top = max([f[0] for f in flags], default=0)
+    ex = date.fromisoformat(t["expiry"])
+    head = f"CHECK {tk} {t['strike']:g}{cp} {ex.month}/{ex.day} x{qty} @ {t['price']:.2f} = ${cost:,.0f}"
+    verdict = {2: "\U0001F6D1 STOP - fix these before you buy",
+               1: "\U0001F7E1 CAUTION - read these first",
+               0: "\U0001F7E2 No flags"}[top]
+    lines = [head, verdict] + ["- " + f[1] for f in flags]
+    try:
+        _eb = next_earnings(tk, n.date())
+        if _eb and 0 <= (_eb - n.date()).days <= 21:
+            _el = earnings_followthrough_line(tk)
+            if _el:
+                lines.append("- INFO: " + _el)
+    except Exception as e:
+        print(f"[check] er info: {e}")
+    lines.append("Nothing was logged. After you buy, paste the order with its 'Filled at' line.")
+    return "\n".join(lines)
+
+
+def cmd_check(text):
+    reply(check_text(text))
+
+
+# option chase v1
+OPT_CHASE_CAUTION = 0.50   # option already up this much today -> caution
+OPT_CHASE_STOP = 1.00      # option already up this much today -> stop
+
+
+def _opt_day_alpaca(tk, expiry, strike, cp):
+    """Option's own move today: {ref, low, high, last} or None."""
+    import alpaca_live
+    sym = alpaca_live.occ(tk, expiry, strike, cp)
+    data = alpaca_live._get("/v1beta1/options/snapshots", {"symbols": sym, "feed": "indicative"})
+    sn = (data.get("snapshots") or {}).get(sym)
+    if not sn:
+        return None
+    day = sn.get("dailyBar") or {}
+    prev = sn.get("prevDailyBar") or {}
+    ref = prev.get("c") or day.get("o")
+    if not ref:
+        return None
+    return {"ref": float(ref), "low": float(day.get("l") or 0) or None,
+            "high": float(day.get("h") or 0) or None, "prev": bool(prev.get("c"))}
+
+
+# option chase yahoo v1
+def _opt_day(tk, expiry, strike, cp):
+    """Alpaca first, Yahoo (about 15 min delayed) if Alpaca has nothing."""
+    try:
+        od = _opt_day_alpaca(tk, expiry, strike, cp)
+        if od:
+            return od
+    except Exception as e:
+        print(f"[check] alpaca option day: {e}")
+    import yfinance as yf
+    from market_extras import _nz
+    ch = yf.Ticker(tk).option_chain(expiry)
+    df = ch.calls if cp == "C" else ch.puts
+    row = df[(df["strike"] - float(strike)).abs() < 1e-6]
+    if row.empty:
+        return None
+    r = row.iloc[0]
+    last, chg = _nz(r.get("lastPrice")), r.get("change")
+    try:
+        chg = float(chg)
+    except (TypeError, ValueError):
+        return None
+    if chg != chg or last <= 0 or last - chg <= 0:
+        return None
+    return {"ref": last - chg, "low": None, "high": None, "prev": True}
+
+
+# earnings followthrough v1
+ER_CACHE = os.path.join(HERE, "earnings_hist.json")
+ER_MIN_MOVE = 0.015
+ER_TTL_DAYS = 14
+
+
+def _er_stats(tk):
+    """How often the stock kept going in its first-day direction over the next 10 days after past reports."""
+    import yfinance as yf
+    t = yf.Ticker(tk)
+    ed = t.get_earnings_dates(limit=16)
+    h = t.history(period="6y", auto_adjust=False)
+    h.index = h.index.tz_localize(None).normalize()
+    today = pd.Timestamp.today().normalize()
+    res, seen = [], set()
+    for stamp in ed.index:
+        s_ = stamp.tz_convert("America/New_York") if stamp.tzinfo else stamp
+        d = s_.tz_localize(None).normalize() if s_.tzinfo else s_.normalize()
+        if d >= today or d in seen:
+            continue
+        seen.add(d)
+        i = h.index.searchsorted(d)
+        if i < 1 or i + 11 >= len(h):
+            continue
+        if s_.hour >= 12:
+            j = i + 1
+        elif s_.hour > 0:
+            j = i
+        else:
+            m0 = abs(h["Close"].iloc[i] / h["Close"].iloc[i - 1] - 1)
+            m1 = abs(h["Close"].iloc[i + 1] / h["Close"].iloc[i] - 1)
+            j = i if m0 >= m1 else i + 1
+        r1 = float(h["Close"].iloc[j] / h["Close"].iloc[j - 1] - 1)
+        if abs(r1) < ER_MIN_MOVE:
+            continue
+        entry = float(h["Open"].iloc[j + 1])
+        f10 = float(h["Close"].iloc[j + 10] / entry - 1) * (1 if r1 > 0 else -1)
+        res.append(f10)
+    if not res:
+        return None
+    res.sort()
+    return {"n": len(res), "k": sum(1 for x in res if x > 0), "med": res[len(res) // 2]}
+
+
+def earnings_followthrough_line(tk):
+    """One info line for pick/check. None if unavailable. Cached for ER_TTL_DAYS."""
+    try:
+        with open(ER_CACHE) as f:
+            cache = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cache = {}
+    hit = cache.get(tk)
+    fresh = hit and (date.today() - date.fromisoformat(hit["day"])).days < ER_TTL_DAYS
+    if not fresh:
+        try:
+            st = _er_stats(tk)
+        except Exception as e:
+            print(f"[er] {tk}: {e}")
+            return None
+        if not st:
+            return None
+        hit = dict(st, day=date.today().isoformat())
+        cache[tk] = hit
+        try:
+            with open(ER_CACHE, "w") as f:
+                json.dump(cache, f)
+        except OSError:
+            pass
+    few = " (few reports, weak evidence)" if hit["n"] < 12 else ""
+    return (f"Past {tk} reports: stock kept going the same way as its first-day move after 10 days "
+            f"{hit['k']}/{hit['n']} times, median {hit['med']:+.1%}{few}. Info only, not a signal.")
+
+
+# dip alert v1
+DIP_PCT = -0.005                          # SPY down at least this much vs yesterday's close
+DIP_WINDOW = (dtime(13, 30), dtime(14, 45))
+DIP_DAYS = {0, 1, 2, 3}                  # Mon-Thu. Fridays you need to be flat by the close.
+_DIP = {"last": 0.0}
+
+
+def _phone_actions(tk):
+    base = os.environ.get("NTFY_PHONE_URL", "").strip().rstrip("/")
+    if not base:
+        try:
+            import subprocess
+            ip = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
+            base = f"http://{ip[0]}:2586" if ip else ""
+        except Exception:
+            base = ""
+    if not base:
+        return None
+    return "; ".join([f"http, Check 1, {base}/trade, method=POST, body=check {tk} 1",
+                      f"http, Check 2, {base}/trade, method=POST, body=check {tk} 2",
+                      f"http, Live, {base}/trade, method=POST, body=live {tk}"])
+
+
+# dip hold note v1
+def _add_trading_days(d, k):
+    while k > 0:
+        d += timedelta(days=1)
+        if market_day(d)["open"]:
+            k -= 1
+    return d
+
+
+def hold_note(n):
+    sell = _add_trading_days(n.date(), 3)
+    txt = (f"IF YOU BUY: hold it at least 3 trading days (earliest sell {sell.strftime('%a')} {sell.month}/{sell.day}). "
+           "In SPY's history, buying after a red day paid off over 3 to 5 days, not overnight.")
+    friday = n.date() + timedelta(days=4 - n.weekday())
+    if sell > friday:
+        txt += ("\nHeads up: that runs past this Friday. Your flat-by-Friday reminder will fire, and holding over "
+                "the weekend is a different bet. Decide before you buy.")
+    txt += "\nThe -20% stop alert can fire before day 3. Decide now whether you will honor it."
+    return txt
+
+
+def dip_text(day, n):
+    head = (f"The market is down: SPY {day:+.1%} today ({n.strftime('%-I:%M %p')} CT).\n"
+            "Want to buy SPY calls on the dip? Here are the two picks, already checked:")
+    parts = [head]
+    for k in (1, 2):
+        try:
+            parts.append(check_text(f"check SPY {k}"))
+        except Exception as e:
+            parts.append(f"(couldn't check SPY pick {k}: {e})")
+    parts.append(hold_note(n))
+    parts.append("Not a signal, just a reminder. If you buy, paste the order with its Filled at line.")
+    return "\n\n".join(parts)
+
+
+def dip_alert_tick(n):
+    if n.weekday() not in DIP_DAYS or not (DIP_WINDOW[0] <= n.time() <= DIP_WINDOW[1]):
+        return
+    if not (can_trade(n) and market_open(n)) or time.time() - _DIP["last"] < 300:
+        return
+    _DIP["last"] = time.time()
+    state_path = os.path.join(HERE, "daily_state.json")
+    try:
+        with open(state_path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    today = n.date().isoformat()
+    if st.get("dip_alert") == today:
+        return
+    import alpaca_live
+    d = alpaca_live.trend(["SPY"]).get("SPY")
+    day = d.get("day") if d else None
+    if day is None or day > DIP_PCT:
+        return
+    st["dip_alert"] = today
+    try:
+        with open(state_path, "w") as f:
+            json.dump(st, f)
+    except OSError:
+        pass
+    alert(dip_text(day, n), title=f"SPY is down {abs(day):.1%} - buy the dip?", priority=PRI_ACTION,
+          tags="chart_with_downwards_trend", actions=_phone_actions("SPY"))
+
+
+def cmd_dip(_):
+    import alpaca_live
+    d = alpaca_live.trend(["SPY"]).get("SPY")
+    if not d or d.get("day") is None:
+        raise ValueError("couldn't read SPY right now")
+    n = now()
+    reply(dip_text(d["day"], n) + f"\n\n(Preview. The real alert fires once a day, Mon-Thu, "
+          f"{DIP_WINDOW[0].strftime('%-I:%M')}-{DIP_WINDOW[1].strftime('%-I:%M')} PM CT, if SPY is down {abs(DIP_PCT):.1%} or more.)")
+
+
+# multi-day run v1
+RUN_CAUTION = 0.03    # already moved this much in your direction over the last 3 sessions
+RUN_STOP = 0.06
+
+
+def _recent_run(tk, price, sign):
+    """Biggest move in the trade's direction from any of the last 4 completed closes. (move, ref_date) or None."""
+    import yfinance as yf
+    h = yf.Ticker(tk).history(period="15d", auto_adjust=False)
+    c = h["Close"].dropna()
+    if not len(c):
+        return None
+    last = float(c.iloc[-1])
+    c = c[[i.date() < now().date() for i in c.index]].iloc[-4:]
+    if not len(c):
+        return None
+    px = float(price) if price else last
+    moves = [(px / float(v) - 1, i.date()) for i, v in c.items()]
+    best = max(moves, key=lambda m: m[0] * sign)
+    return best if best[0] * sign > 0 else None
+
+
+# restriction v1
+def _md(txt, future):
+    m = RE_DATE.match(txt)
+    if not m:
+        raise ValueError("date like 10/23")
+    mo, d = int(m.group(1)), int(m.group(2))
+    y = int(m.group(3)) if m.group(3) else now().year
+    if y < 100:
+        y += 2000
+    dt = date(y, mo, d)
+    today = now().date()
+    if not m.group(3):
+        if future and dt < today:
+            dt = date(y + 1, mo, d)
+        if not future and dt > today:
+            dt = date(y - 1, mo, d)
+    return dt
+
+
+def restriction_end():
+    try:
+        v = load_account().get("restricted_until")
+        end = date.fromisoformat(v) if v else None
+    except (ValueError, TypeError):
+        return None
+    return end if end and end >= now().date() else None
+
+
+def restriction_text():
+    end = restriction_end()
+    if not end:
+        return None
+    left = (end - now().date()).days
+    return (f"RESTRICTED (good faith violations) until {end.strftime('%a')} {end.month}/{end.day}/{end.year}, "
+            f"{left} days left. Buy only with cash that was already settled before you place the order.")
+
+
+def cmd_restricted(words):
+    a = load_account()
+    if not words:
+        reply(restriction_text() or "No restriction set. Send: restricted from 10/23  (90 days later) or restricted until 1/21")
+        return
+    w = words[0].lower()
+    if w in ("off", "none", "clear"):
+        a["restricted_until"] = None
+    elif w == "from" and len(words) > 1:
+        a["restricted_until"] = (_md(words[1], future=False) + timedelta(days=90)).isoformat()
+    elif w == "until" and len(words) > 1:
+        a["restricted_until"] = _md(words[1], future=True).isoformat()
+    else:
+        raise ValueError("like: restricted from 10/23   or   restricted until 1/21   or   restricted off")
+    save_account(a)
+    reply(restriction_text() or "Restriction cleared.")
+
+
 def check_expiries():
     today = now().date()
     with lock:
@@ -1571,17 +2198,66 @@ def tuesday_open():
 _FLAT_SENT = {"day": None}
 
 
+# dip hold v1
+def _dip_alert_today(n):
+    try:
+        with open(os.path.join(HERE, "daily_state.json")) as f:
+            return json.load(f).get("dip_alert") == n.date().isoformat()
+    except (OSError, ValueError):
+        return False
+
+
 def friday_flat():
     pos = load_positions()
-    if pos:
-        n = now()
-        md = market_day(n.date())
-        why = "last trading day this week" if n.weekday() != 4 else "Friday"
-        if md["early"]:
-            why += f", early close at {md['close'].strftime('%-I:%M %p')}"
-        alert("Still holding:\n" + "\n".join(p["id"] + f" x{p['qty']}" for p in pos) +
+    n = now()
+    today = n.date().isoformat()
+    held = [p for p in pos if p.get("hold_until") and p["hold_until"] > today]
+    due = [p for p in pos if p not in held]
+    md = market_day(n.date())
+    why = "last trading day this week" if n.weekday() != 4 else "Friday"
+    if md["early"]:
+        why += f", early close at {md['close'].strftime('%-I:%M %p')}"
+    if due:
+        alert("Still holding:\n" + "\n".join(p["id"] + f" x{p['qty']}" for p in due) +
               f"\nRule: flat before the weekend ({why}). 30 minutes left.",
               title="Get flat - market closes soon", priority=PRI_URGENT, tags="warning")
+    if held:
+        lines = []
+        for p in held:
+            d = date.fromisoformat(p["hold_until"])
+            lines.append(f"{p['id']} x{p['qty']} - dip trade, hold until at least {d.strftime('%a')} {d.month}/{d.day}")
+        alert("Holding over the weekend on purpose:\n" + "\n".join(lines) +
+              "\nThe get-flat rule is skipped for these. Stop and target alerts still run.",
+              title="Holding over the weekend", priority=PRI_INFO, tags="information_source")
+
+
+def hold_due():
+    today = now().date().isoformat()
+    due = [p for p in load_positions() if p.get("hold_until") == today]
+    if due:
+        alert("The 3-day hold is up today:\n" + "\n".join(p["id"] + f" x{p['qty']}" for p in due) +
+              "\nYou can sell any time now. The normal rules (stop, targets, flat by Friday) apply again.",
+              title="Dip hold is over", priority=PRI_ACTION, tags="alarm_clock")
+
+
+def cmd_hold(words):
+    if not words:
+        raise ValueError("like: hold SPY   (marks your SPY position as a 3-day dip hold)")
+    tk = words[0].upper()
+    with lock:
+        pos = load_positions()
+        hits = [p for p in pos if p["ticker"] == tk]
+        if not hits:
+            raise ValueError(f"no open {tk} position")
+        for p in hits:
+            opened = datetime.fromisoformat(p["opened"]).date()
+            p["hold_until"] = _add_trading_days(opened, 3).isoformat()
+        save_positions(pos)
+    d = date.fromisoformat(hits[0]["hold_until"])
+    if d <= now().date():
+        reply(f"{tk} is already past 3 trading days, so the normal rules apply.")
+    else:
+        reply(f"{tk}: holding until at least {d.strftime('%a')} {d.month}/{d.day}. The Friday get-flat reminder is skipped until then.")
 
 
 def flat_check(n):
@@ -1656,7 +2332,7 @@ def main():
     threading.Thread(target=listen, daemon=True).start()
     reply("tradebot online. Send 'help' for commands.")
     daily = [Daily(8, 0, morning_brief), Daily(8, 35, check_expiries), Daily(15, 30, friday_scorecard, days=[4]), Daily(8, 40, earnings_watch), Daily(11, 0, tuesday_open, days=[0, 1]),
-             Daily(15, 10, end_of_day)]
+             Daily(15, 10, end_of_day), Daily(8, 45, hold_due)]
     last_pos = last_nvda = last_live = 0.0
     nvda_zone = None
     while True:
@@ -1666,6 +2342,7 @@ def main():
         run(lambda: flat_check(n))
         run(lambda: beat("tradebot", quote_ok=LAST_QUOTE_OK))
         if market_open(n):
+            run(lambda: dip_alert_tick(n))
             if time.time() - last_pos >= POLL_SEC:
                 last_pos = time.time()
                 run(check_positions)

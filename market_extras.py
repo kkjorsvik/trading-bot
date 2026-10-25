@@ -216,7 +216,8 @@ def _account_budget():
         a = _load(os.path.join(HERE, "account.json"), {})
         if not a.get("balance"):
             return None
-        return round(a["balance"] * (1 - a.get("cash_pct", 0.5)) / a.get("slots", 2), -1)
+        tp = a.get("trade_pct") or (1 - a.get("cash_pct", 0.5)) / a.get("slots", 2)
+        return round(a["balance"] * tp, -1)
     except Exception:
         return None
 
@@ -229,7 +230,11 @@ def _nz(x):  # nan guard v1
     return x if x == x else 0.0
 
 
-def contract_options(ticker, today=None, min_dte=9, max_spread=0.20, cp="C"):
+# thin filter v1
+MIN_OPT_OI = 250   # skip options with fewer open contracts than this
+
+
+def contract_options(ticker, today=None, min_dte=9, max_spread=0.15, cp="C"):
     """Two calls on the first expiry 9+ days out: at-the-money and one strike higher. Returns (spot, exp, rows)."""
     import yfinance as yf
     today = today or date.today()
@@ -250,6 +255,8 @@ def contract_options(ticker, today=None, min_dte=9, max_spread=0.20, cp="C"):
         for _, r in calls.head(4).iterrows():
             bid, ask = _nz(r.get("bid")), _nz(r.get("ask"))
             oi = int(_nz(r.get("openInterest")))
+            if oi < MIN_OPT_OI:
+                continue
             stale = False
             if bid <= 0 or ask <= 0:
                 last = _nz(r.get("lastPrice"))

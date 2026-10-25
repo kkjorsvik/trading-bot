@@ -19,3 +19,4 @@ earnings_cache.json
 *.csv
 __pycache__/
 venv/
+earnings_hist.json

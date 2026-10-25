@@ -14,7 +14,7 @@ and change them to fit YOU:
 
 - **Tickers:** `WATCHLIST` in tradebot.py and `my_tickers` in newswatch.py
 - **Rules and trading window:** `RULES`, `TRADE_DAYS` and `DAY_START` in tradebot.py
-  (the default is: Mon and Tue start at 11 AM Central, Wed-Fri all day, flat by Friday, long calls and puts only)
+  (the default is: Mon and Tue start at 11 AM Central, Wed-Fri start at 9 AM, flat by Friday, long calls and puts only)
 - **Stops and targets:** `STOP`, `TARGETS` and `SOFT` in tradebot.py (-20%, +20%/+40%, +/-10%)
 - **Position size:** set with `balance` and the cash/slots settings (default 50% cash, 2 positions)
 - **Fees:** `FEE_PER_CONTRACT` in tradebot.py ($0.65 each way is a Fidelity-style number)
@@ -76,6 +76,40 @@ You can also paste an order straight from Fidelity (include the "Filled at $..."
     Buy to Open
     5 Contracts SPY Oct 26 2026 775 Calls Limit at $3.79 (Day)
     Filled at $2.72
+
+## Added since the first release
+
+More commands (text them to the `trade` topic):
+
+    check LLY 1             # pre-trade check of pick #1 (or 2; add 'put', or x3 for quantity). Logs nothing.
+    check <paste a Buy to Open order>   # same, for a specific order
+    dip                     # preview the "market is down, buy SPY?" alert
+    hold SPY                # mark an open SPY position as a 3-day hold (skips the Friday get-flat reminder)
+    balance pct 25          # per-trade budget as a percent of your account
+    restricted from 10/23   # track a 90-day settled-cash-only restriction ('restricted off' clears it)
+
+What changed:
+
+- **Pre-trade check.** `check` looks at your size against your per-trade limit, settled cash, how thin the
+  option is (open interest, bid/ask gap), how far the stock has already moved today and over the last
+  three sessions, how far the option itself has already run, how old the signal is, and the trading window.
+  It ends in STOP, CAUTION or no flags. It never blocks anything; you decide.
+- **Thin-option filter.** Suggested contracts need at least `MIN_OPT_OI` open contracts (250) and a bid/ask gap
+  under 15% (`market_extras.py`).
+- **Trading window.** Wed-Fri start at 9:00 AM Central (Mon/Tue at 11:00). See `DAY_START` in tradebot.py.
+- **Overnight signals.** Buy/put signals between 8 PM and 6 AM, and on weekends and holidays, are held for the
+  next check-in instead of pushed. Check-ins are 6 AM, 8 AM, noon and 3 PM (`CHECKINS` in newswatch.py).
+  Headlines published more than `MAX_NEWS_AGE_H` (12) hours ago are skipped.
+- **SPY hot-buy** also looks at SPY's trend today (`HOT_MIN_DAY`, `HOT_MIN_NOW`), not only the day of the week.
+- **SPY dip reminder.** Mon-Thu, 1:30-2:45 PM Central, if SPY is down `DIP_PCT` (0.5%) it sends the SPY picks,
+  already checked, with a note to hold at least 3 trading days (`DIP_PCT`, `DIP_WINDOW`, `DIP_DAYS`).
+- **Tap buttons on alerts** (Check 1 / Check 2 / Live). They post to your ntfy `trade` topic from your phone, so
+  the bot finds your Tailscale address with `tailscale ip -4`. If you don't use Tailscale, set the
+  `NTFY_PHONE_URL` environment variable to an address your phone can reach, like http://my-server:2586.
+- **Earnings line.** When earnings are within 3 weeks, `pick` and `check` add how the stock behaved after
+  past reports. It is information, not a signal.
+
+These thresholds are one person's guesses. Review them (see the notice at the top) before relying on them.
 
 ## Things to change for your own use
 
