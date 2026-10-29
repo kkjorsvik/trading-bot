@@ -20,3 +20,9 @@ earnings_cache.json
 __pycache__/
 venv/
 earnings_hist.json
+decisions.csv
+llm_log2.csv
+swing_log.csv
+sameday_log.csv
+intraday_cache.pkl
+paper_log.csv

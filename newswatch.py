@@ -178,8 +178,8 @@ def check_actions(t, cp="C"):
         return None
     side = " put" if cp == "P" else ""
     parts = [f"http, Check 1, {base}/trade, method=POST, body=check {t} 1{side}",
-             f"http, Check 2, {base}/trade, method=POST, body=check {t} 2{side}",
-             f"http, Live, {base}/trade, method=POST, body=live {t}"]
+             f"http, Buy, {base}/trade, method=POST, body=buy {t}{side}, clear=true",
+             f"http, Skip, {base}/trade, method=POST, body=skip {t}{side}, clear=true"]
     return "; ".join(parts)
 
 
@@ -793,20 +793,20 @@ def handle(item):
                         wl.pop(min(wl, key=lambda k: wl[k]["last_event"]))
                     wl[t] = {"added": stamp, "last_event": stamp, "status": "watching", "reason": EVENT_LABEL[ev],
                              "price_added": price, "source": "news", "events": [], "alerted": {}}
-                    alert(line + "\nAdded to deal watch. Speculative - many of these never become deals.\n" + hist,
-                          title=f"\U0001F440 {t}: {EVENT_LABEL[ev]}", priority=3, tags="eyes")
+                    info_alert(line + "\nAdded to deal watch. Speculative - many of these never become deals.\n" + hist,
+                               title=f"\U0001F440 {t}: {EVENT_LABEL[ev]}", priority=3, tags="eyes", held=held)
                 else:
                     w["last_event"] = stamp
-                    alert(line + "\n" + hist, title=f"{t} follow-up: {EVENT_LABEL[ev]}", priority=4, tags="newspaper")
+                    info_alert(line + "\n" + hist, title=f"{t} follow-up: {EVENT_LABEL[ev]}", priority=4, tags="newspaper", held=held)
             elif ev == "deal_announced":
                 if w is not None:
                     w["status"], w["last_event"] = "announced", stamp
-                alert(line + "\nDon't chase: after a deal is announced the stock usually pins near the deal "
-                             "price, and calls lose value fast.",
-                      title=f"{t}: deal announced", priority=4 if (w is not None or held) else 3, tags="handshake")
+                info_alert(line + "\nDon't chase: after a deal is announced the stock usually pins near the deal "
+                                  "price, and calls lose value fast.",
+                           title=f"{t}: deal announced", priority=4 if held else 3, tags="handshake", held=held)
             elif ev == "deal_terminated" and w is not None:
                 wl.pop(t)
-                alert(line + "\nRemoved from deal watch.", title=f"{t}: deal off", priority=4, tags="x")
+                info_alert(line + "\nRemoved from deal watch.", title=f"{t}: deal off", priority=4, tags="x", held=held)
             if t in wl:
                 wl[t].setdefault("events", []).append({"time": stamp, "event": ev, "title": item["title"][:200]})
                 wl[t]["events"] = wl[t]["events"][-10:]
@@ -821,6 +821,16 @@ def handle(item):
         floor_ok, floor_why = signal_floor(t, price)
         put_ok = floor_ok and confirmed_dn and not crushed and (proven_dn or strength == 3)
         st = state()
+        if put_ok and _repeat_signal(t, ev, "P"):
+            print(f"[dedupe] skipped repeat put signal {t} {ev}")
+            return
+        _extra = ""
+        if put_ok and st["alerts"] < MAX_ALERTS_DAY:
+            _send, _extra = pre_send(t, ev, "P", item["title"], info["summary"], chg, volx, held)
+            if not _send:
+                print(f"[trend] held back put signal {t} {ev}")
+                digest_add(f"- held back (trend/model said no): {short}" + _extra.replace("\n", " | "))
+                return
         if put_ok and st["alerts"] < MAX_ALERTS_DAY:
             st["alerts"] += 1
             save_json(STATE_FILE, st)
@@ -830,15 +840,15 @@ def handle(item):
             if strength == 3:
                 why.append("major news")
             head = "\nYou HOLD this - consider your exit." if held else ""
-            alert_signal(line + head + "\nPut signal: " + "; ".join(why) + earnings_line(t) + contract_text(t, cp="P") + "\n" + hist,
+            alert_signal(line + head + "\nPut signal: " + "; ".join(why) + _extra + earnings_line(t) + contract_text(t, cp="P") + "\n" + hist,
                   title=f"\U0001F53B PUT SIGNAL {t}: {EVENT_LABEL[ev]}", priority=5, tags="chart_with_downwards_trend",
                   actions=check_actions(t, "P"))
             record_signal(t, ev, "P")
             return
         if held or watched:
             where = "you HOLD this" if held else "it's on your watch list"
-            alert(line + f"\nHeads up - {where}.\n" + hist, title=f"⚠️ {t}: {EVENT_LABEL[ev]}",
-                  priority=5 if held else 4, tags="warning")
+            info_alert(line + f"\nHeads up - {where}.\n" + hist, title=f"⚠️ {t}: {EVENT_LABEL[ev]}",
+                       priority=5 if held else 4, tags="warning", held=held)
         else:
             digest_add(f"- {short}")
         return
@@ -850,6 +860,16 @@ def handle(item):
         floor_ok, floor_why = signal_floor(t, price)
         opportunity = floor_ok and confirmed and not hot and (proven or strength == 3 or ((held or watched) and strength >= 2))
         st = state()
+        if opportunity and _repeat_signal(t, ev, "C"):
+            print(f"[dedupe] skipped repeat buy signal {t} {ev}")
+            return
+        _extra = ""
+        if opportunity and st["alerts"] < MAX_ALERTS_DAY:
+            _send, _extra = pre_send(t, ev, "C", item["title"], info["summary"], chg, volx, held)
+            if not _send:
+                print(f"[trend] held back buy signal {t} {ev}")
+                digest_add(f"+ held back (trend/model said no): {short}" + _extra.replace("\n", " | "))
+                return
         if opportunity and st["alerts"] < MAX_ALERTS_DAY:
             st["alerts"] += 1
             save_json(STATE_FILE, st)
@@ -861,7 +881,7 @@ def handle(item):
             if held or watched:
                 why.append("you hold/watch it")
             pp = paper_open(t, ev)
-            alert_signal(line + "\nBuy signal: " + "; ".join(why) + earnings_line(t) + pp + contract_text(t) + "\n" + hist,
+            alert_signal(line + "\nBuy signal: " + "; ".join(why) + _extra + earnings_line(t) + pp + contract_text(t) + "\n" + hist,
                   title=f"\U0001F525 BUY SIGNAL {t}: {EVENT_LABEL[ev]}", priority=5, tags="fire",
                   actions=check_actions(t))
             record_signal(t, ev)
@@ -869,7 +889,7 @@ def handle(item):
             note = "\nAlready up a lot today - careful chasing." if hot else ""
             if not floor_ok:
                 note += f"\nNot a buy signal: {floor_why}."
-            alert(line + note + "\n" + hist, title=f"\U0001F4C8 {t}: {EVENT_LABEL[ev]}", priority=3)
+            info_alert(line + note + "\n" + hist, title=f"\U0001F4C8 {t}: {EVENT_LABEL[ev]}", priority=3, held=held)
         else:
             digest_add(f"+ {short}")
 
@@ -901,6 +921,221 @@ def alert_signal(msg, title, priority=5, tags=None, actions=None):
         alert(msg, title, priority=priority, tags=tags, actions=actions)
 
 
+# trend gate v1
+TREND_GATE = True      # signals whose trend disagrees go to the digest instead of your phone
+LLM_VETO = False       # True = a 'WAIT' from the model also holds the signal back (leave False until it proves itself)
+LLM_LOG = os.path.join(HERE, "llm_checks.csv")
+_TREND_CACHE = {}
+
+
+def _trend_hist(t):
+    import yfinance as yf
+    return yf.Ticker(t).history(period="8mo", auto_adjust=True, timeout=15)
+
+
+def trend_check(t, side):
+    """MACD histogram and 20-day average vs the signal's direction, from completed daily bars. None = unavailable."""
+    key = (t, now().date().isoformat())
+    if key not in _TREND_CACHE:
+        try:
+            import pandas as pd
+            df = _trend_hist(t)
+            h = df[df.index.tz_localize(None).normalize() < pd.Timestamp(now().date())]
+            c = h["Close"]
+            if len(c) < 40:
+                raise ValueError("not enough history")
+            macd = c.ewm(span=12).mean() - c.ewm(span=26).mean()
+            hist = float((macd - macd.ewm(span=9).mean()).iloc[-1])
+            _TREND_CACHE[key] = {"hist": hist, "close": float(c.iloc[-1]), "sma20": float(c.rolling(20).mean().iloc[-1])}
+        except Exception as e:
+            print(f"[trend] {t}: {e}")
+            _TREND_CACHE[key] = None
+    d = _TREND_CACHE[key]
+    if not d:
+        return None
+    up = side == "C"
+    macd_ok = (d["hist"] > 0) == up
+    sma_ok = (d["close"] > d["sma20"]) == up
+    return {"macd_ok": macd_ok, "sma_ok": sma_ok, "both": macd_ok and sma_ok, **d}
+
+
+def trend_text(tr, side):
+    if tr is None:
+        return "Trend: couldn't be checked."
+    way = "up" if side == "C" else "down"
+    bits = [f"MACD {'agrees' if tr['macd_ok'] else 'DISAGREES'}",
+            f"stock is {'above' if tr['close'] > tr['sma20'] else 'below'} its 20-day average ({tr['close']:.2f} vs {tr['sma20']:.2f})"]
+    tail = "past cases when both agree: about 65% win vs 49%" if tr["both"] else "past cases when they don't both agree: about 49% win"
+    return f"Trend ({way} signal): " + ", ".join(bits) + f". {tail}."
+
+
+# llm checks v2
+LLM_VETO_DUP = True    # the model says this is a rewrite of a story already sent (and names which one) -> hold it back
+LLM_LOG = os.path.join(HERE, "llm_log2.csv")
+
+
+def _recent_headlines(t, current_title, hours=48, n=8):
+    out = []
+    try:
+        with open(OUTCOMES) as f:
+            rows = [r for r in csv.DictReader(f) if r["ticker"] == t]
+    except FileNotFoundError:
+        return out
+    cut = now() - timedelta(hours=hours)
+    for r in reversed(rows):
+        try:
+            when = datetime.fromisoformat(r["time"])
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=now().tzinfo)
+        except Exception:
+            continue
+        if when < cut:
+            break
+        if r["title"][:60] == current_title[:60]:
+            continue
+        out.append(f"{when.strftime('%a %-I:%M %p')}: {r['title'][:110]}")
+        if len(out) >= n:
+            break
+    return out
+
+
+def llm_lastlook(t, side, title, summary, chg, volx, tr):
+    """The model's checks: same story as one already sent? supports the direction? priced in? contradicted?
+    Python supplies the numbers. Fails open (returns None)."""
+    way = "BUY CALLS (bet the stock goes up)" if side == "C" else "BUY PUTS (bet the stock goes down)"
+    facts = f"today's move {chg:+.1%}" if chg is not None else "today's move unknown"
+    if volx:
+        facts += f", volume {volx:.1f}x normal"
+    facts += ". " + trend_text(tr, side)
+    recent = _recent_headlines(t, title)
+    listing = "\n".join(f"{i}. {h}" for i, h in enumerate(recent, 1)) or "(none)"
+    msg = ("You are a cautious options trader reviewing a signal before it is sent to a trader.\n"
+           f"Proposed trade: {way} on {t}.\nNEW headline: {title}\nDetails: {summary}\nFacts: {facts}\n"
+           f"Earlier headlines on {t} in the last 48 hours:\n{listing}\n\n"
+           "Answer these:\n"
+           "- same_story_as: the NUMBER of an earlier headline that reports the SAME specific event as the new headline "
+           "(a rewrite or follow-up of one story), or 0 if the new headline is a different event.\n"
+           "- supports_direction: true only if the new headline is really good news for the stock (calls) or bad news (puts).\n"
+           "- priced_in: true if the stock has probably already moved on this news, given today's move.\n"
+           "- conflict: true if an earlier headline points the other way.\n"
+           "- verdict: GO or WAIT.\n"
+           'Reply with JSON only: {"same_story_as": 0, "supports_direction": true, "priced_in": false, '
+           '"conflict": false, "verdict": "GO", "reason": "under 15 words"}')
+    try:
+        r = requests.post(OLLAMA, json={"model": MODEL, "stream": False, "format": "json", "keep_alive": "30m",
+                                        "options": {"temperature": 0}, "messages": [{"role": "user", "content": msg}]},
+                          timeout=90)
+        r.raise_for_status()
+        d = json.loads(r.json()["message"]["content"])
+        v = str(d.get("verdict", "")).upper()
+        if v not in ("GO", "WAIT"):
+            return None
+        try:
+            same = int(d.get("same_story_as") or 0)
+        except (TypeError, ValueError):
+            same = 0
+        if not 1 <= same <= len(recent):
+            same = 0   # it has to point at a headline that really exists
+        return {"verdict": v, "reason": str(d.get("reason", ""))[:120], "same": recent[same - 1] if same else "",
+                "supports": bool(d.get("supports_direction", True)), "priced": bool(d.get("priced_in", False)),
+                "conflict": bool(d.get("conflict", False))}
+    except Exception as e:
+        print(f"[llm look] {e}")
+        return None
+
+
+def pre_send(t, ev, side, title, summary, chg, volx, held):
+    """Runs just before a signal is pushed. Returns (send, extra_text)."""
+    tr = trend_check(t, side)
+    look = llm_lastlook(t, side, title, summary, chg, volx, tr)
+    try:
+        new = not os.path.exists(LLM_LOG)
+        with open(LLM_LOG, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["time", "ticker", "event", "side", "trend_both", "verdict", "same_story", "supports",
+                            "priced_in", "conflict", "reason", "title"])
+            L = look or {}
+            w.writerow([now().isoformat(timespec="seconds"), t, ev, side, "" if tr is None else int(tr["both"]),
+                        L.get("verdict", ""), L.get("same", ""), L.get("supports", ""), L.get("priced", ""),
+                        L.get("conflict", ""), L.get("reason", ""), title[:120]])
+    except Exception as e:
+        print(f"[llm log] {e}")
+    extra = "\n" + trend_text(tr, side)
+    if look:
+        flags = []
+        if look["same"]:
+            flags.append("SAME STORY as: " + look["same"])
+        if not look["supports"]:
+            flags.append("headline may not support this direction")
+        if look["priced"]:
+            flags.append("may be priced in")
+        if look["conflict"]:
+            flags.append("earlier news points the other way")
+        extra += f"\nModel last look: {look['verdict']} - {look['reason']}"
+        if flags:
+            extra += "\nModel flags: " + "; ".join(flags)
+    if held:
+        return True, extra
+    if TREND_GATE and tr is not None and not tr["both"]:
+        return False, extra
+    if look and LLM_VETO_DUP and look["same"]:
+        return False, extra
+    if look and LLM_VETO and look["verdict"] == "WAIT":
+        return False, extra
+    return True, extra
+
+
+# event dedupe v1
+DEDUPE_HOURS = 48      # same ticker + same news type + same direction inside this window = a repeat
+MAX_SIGNALS_TICKER_DAY = 2
+
+
+# skip suppress v1
+def _skipped_today(t, side):
+    """True if you tapped/typed Skip on this ticker and direction today."""
+    try:
+        import csv
+        n = now()
+        with open(os.path.join(HERE, "decisions.csv")) as f:
+            for r in csv.DictReader(f):
+                if r["decision"] == "skip" and r["ticker"] == t and r["side"] == side and r["time"][:10] == n.date().isoformat():
+                    return True
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[skip check] {e}")
+    return False
+
+
+def _repeat_signal(t, ev, side="C"):
+    """True if this is a re-report of a signal we already sent (or the ticker already had its fill today)."""
+    if _skipped_today(t, side):
+        return True
+    try:
+        with open(os.path.join(HERE, "buy_signals.json")) as f:
+            sigs = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    n = now()
+    today = 0
+    for x in sigs:
+        if x.get("ticker") != t:
+            continue
+        try:
+            when = datetime.fromisoformat(x["time"])
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=n.tzinfo)
+        except Exception:
+            continue
+        hrs = (n - when).total_seconds() / 3600
+        if x.get("event") == ev and x.get("side", "C") == side and hrs < DEDUPE_HOURS:
+            return True
+        if when.astimezone(n.tzinfo).date() == n.date():
+            today += 1
+    return today >= MAX_SIGNALS_TICKER_DAY
+
+
 def record_signal(t, ev, side="C"):
     try:
         path = os.path.join(HERE, "buy_signals.json")
@@ -918,6 +1153,18 @@ def record_signal(t, ev, side="C"):
 
 
 from market_extras import contract_text
+
+
+# info to digest v1
+INFO_TO_DIGEST = True    # news heads-ups on tickers you do NOT hold go to the digest, not your phone
+
+
+def info_alert(msg, title, priority=3, tags=None, held=False):
+    """Unvalidated heads-ups. Held tickers still ping you (exit warnings); everything else waits for the digest."""
+    if INFO_TO_DIGEST and not held:
+        digest_add(f"~ {title}: " + msg.split("\n")[0][:140])
+        return
+    alert(msg, title=title, priority=priority, tags=tags)
 
 
 def scan():
@@ -1014,8 +1261,8 @@ def check_activity():
                       title=f"\U0001F525 BUY SIGNAL {t}: unusual activity", priority=5, tags="fire",
                       actions=check_actions(t))
             else:
-                alert("\n".join(msgs) + f"\nOn watch since {w['added'][:10]}: {w['reason']}.",
-                      title=f"\U0001F6A8 {t}: unusual activity", priority=3)
+                info_alert("\n".join(msgs) + f"\nOn watch since {w['added'][:10]}: {w['reason']}.",
+                           title=f"\U0001F6A8 {t}: unusual activity", priority=3, held=(t in held_tickers()))
 
 
 def expire():

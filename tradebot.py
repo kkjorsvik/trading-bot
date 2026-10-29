@@ -48,7 +48,7 @@ MIN_DTE = 9                # rule: days to expiry at entry
 NVDA_MAX_EXT10 = 0.02      # pullback zone: <= 2% above 10-day avg
 NVDA_MAX_RSI = 60          # ...and RSI(14) under 60
 TRADE_DAYS = {0, 1, 2, 3, 4}  # Mon-Fri (Mon = 0)  # puts+monday v1
-DAY_START = {0: dtime(11, 0), 1: dtime(11, 0), 2: dtime(9, 0), 3: dtime(9, 0), 4: dtime(9, 0)}  # quiet v1: Mon/Tue 11:00, other days 9:00 (the open is too volatile)
+DAY_START = {0: dtime(11, 0), 1: dtime(9, 0), 2: dtime(9, 0), 3: dtime(9, 0), 4: dtime(9, 0)}  # tuesday open v1: Mon 11:00, Tue-Fri 9:00 (the open is too volatile)
 HOT_DAYS = {2, 3, 4}       # the 12-for-12 SPY setup was Wed-Fri
 
 
@@ -104,8 +104,17 @@ def send(topic, msg, title=None, priority=3, tags=None, actions=None):
         print(f"[send failed] {e}")
 
 
+# reply spacing v1
+_LAST_REPLY = [0.0]
+
+
 def reply(msg):
+    # ntfy can show same-second messages out of order, so keep replies at least 1.2s apart
+    gap = 1.2 - (time.time() - _LAST_REPLY[0])
+    if gap > 0:
+        time.sleep(gap)
     send(CMD_TOPIC, msg, title=BOT_TITLE, priority=3)
+    _LAST_REPLY[0] = time.time()
 
 
 def alert(msg, title, priority, tags=None, actions=None):
@@ -926,6 +935,9 @@ news    - recent news hits (news NVDA)
 dip     - preview the 'market is down, buy SPY?' alert
 restricted from 10/23 - set the 90-day settled-cash-only restriction (also: until 1/21, off)
 hold SPY - mark a SPY position as a 3-day dip hold (skips Friday get-flat)
+swing LLY - hold a position to the next close: -30% stop, no +20% prompt (not on Fridays)
+sameday LLY - undo a swing, back to the normal same-day rules
+buy LLY / skip LLY - say what you did with an alert (plain 'buy' or 'skip' = the latest one); 'decisions' shows how each did
 check   - pre-trade check, logs nothing: check LLY 1 (pick #1 or #2; add put, or x3), or paste a Buy to Open order
 signal LLY - is the 🔥/🔻 signal still strong, fading or gone
 scoreboard - which news types actually moved stocks
@@ -934,7 +946,7 @@ congress - recent Congress buys (congress NVDA / congress pelosi)
 drop SPY 750C   - remove a mistaken entry (no P/L logged)"""
 
 RULES = f"""Rulebook
-1. Mon and Tue after 11 AM. Wed-Fri all day. Flat by Friday close.
+1. Mon after 11 AM. Tue-Fri from 9 AM. Flat by Friday close.
 2. NVDA calls only in the pullback zone.
 3. SPY entries as usual.
 4. {MIN_DTE}+ days to expiry. Out at {STOP:.0%}.
@@ -949,6 +961,8 @@ def find_position(pos, t):
 
 
 def cmd_buy(words):
+    if not words or all(re.fullmatch(r"[A-Za-z.]{1,6}", w) for w in words):
+        return cmd_buy_decision(words)
     n = now()
     t = parse_trade(words, n.date())
     for k, label in [("expiry", "expiry like 5/22"), ("qty", "quantity like x5"), ("price", "price like @4.10")]:
@@ -987,16 +1001,27 @@ def cmd_buy(words):
                 _hu = date.fromisoformat(p["hold_until"])
                 note += (f"\nDip trade: hold until at least {_hu.strftime('%a')} {_hu.month}/{_hu.day}. "
                          "The Friday get-flat reminder is skipped until then.")
+            elif SWING_DEFAULT and n.weekday() != 4 and _latest_signal(t["ticker"]):
+                _auto_swing(p, n)
+                _hu = date.fromisoformat(p["hold_until"])
+                note += (f"\nSWING (default for a bot signal): holding to the close of {_hu.strftime('%a')} {_hu.month}/{_hu.day}. "
+                         "No +20% prompt. Tap Same day if you want the normal same-day rules instead.")
         save_positions(pos)
         log_trade("buy", pid, t["qty"], t["price"])
         log_rules(pid, warnings)
-    msg = (f"{note}\nStop alert at {level_price(p['entry'], STOP):.2f} ({STOP:.0%} after fees)"
-           f" | +20% at {level_price(p['entry'], 0.20):.2f}")
+    _stop = p.get("stop", STOP)
+    _tg = (p.get("targets") or [0.20])[0] if p.get("swing") else 0.20
+    msg = (f"{note}\nStop alert at {level_price(p['entry'], _stop):.2f} ({_stop:.0%} after fees)"
+           f" | +{_tg:.0%} at {level_price(p['entry'], _tg):.2f}")
     if warnings:
         msg += "\n\nRULE CHECK:\n- " + "\n- ".join(warnings)
     if any("hot SPY" in w for w in warnings) and len(warnings) == 1:
         msg = msg.replace("RULE CHECK:", "SETUP:")
-    reply(msg)
+    _btn = _sameday_actions(t["ticker"]) if p.get("swing") else _swing_actions(t["ticker"])
+    if t["ticker"] and datetime.now(TZ).weekday() != 4 and _btn:
+        send(CMD_TOPIC, msg, title=BOT_TITLE, priority=3, actions=_btn)  # swing / same-day button
+    else:
+        reply(msg)
 
 
 def cmd_sell(words):
@@ -1330,7 +1355,7 @@ def cmd_cash(_):
 
 
 COMMANDS = {"buy": cmd_buy, "sell": cmd_sell, "drop": cmd_drop, "list": cmd_list,
-            "status": cmd_list, "cash": cmd_cash, "stats": cmd_stats, "pick": cmd_pick, "live": lambda w: cmd_live(w), "signal": lambda w: cmd_signal(w), "restricted": lambda w: cmd_restricted(w), "hold": lambda w: cmd_hold(w), "dip": lambda w: cmd_dip(w), "balance": cmd_balance, "scorecard": cmd_scorecard, "scoreboard": cmd_scoreboard, "news": cmd_news_verdicts, "nvda": cmd_nvda, "spy": cmd_spy, "watch": cmd_watch, "congress": cmd_congress,
+            "status": cmd_list, "cash": cmd_cash, "stats": cmd_stats, "pick": cmd_pick, "live": lambda w: cmd_live(w), "signal": lambda w: cmd_signal(w), "restricted": lambda w: cmd_restricted(w), "hold": lambda w: cmd_hold(w), "swing": lambda w: cmd_swing(w), "sameday": lambda w: cmd_sameday(w), "skip": lambda w: cmd_skip(w), "decisions": lambda w: cmd_decisions(w), "dip": lambda w: cmd_dip(w), "balance": cmd_balance, "scorecard": cmd_scorecard, "scoreboard": cmd_scoreboard, "news": cmd_news_verdicts, "nvda": cmd_nvda, "spy": cmd_spy, "watch": cmd_watch, "congress": cmd_congress,
             "rules": lambda _: reply(RULES), "help": lambda _: reply(HELP)}
 
 
@@ -1435,22 +1460,26 @@ def check_positions():
                 continue
             globals()["LAST_QUOTE_OK"] = time.time()
             pct, usd = net_pct_usd(p["entry"], mid, p["qty"])
-            if pct <= STOP:
+            stop = p.get("stop", STOP)            # swing v1: swing trades use a wider stop
+            targets = p.get("targets", TARGETS)
+            swing = bool(p.get("swing"))
+            soft_dn = abs(stop) / 2
+            if pct <= stop:
                 last = datetime.fromisoformat(p["stop_last"]) if p["stop_last"] else None
                 if not last or n - last >= timedelta(minutes=STOP_REPEAT_MIN):
                     again = " (still)" if last else ""
                     alert(f"{p['id']} is {pct:+.0%}{again}  (${abs(usd):,.0f} down)\n"
                           f"{p['entry']:.2f} -> {mid:.2f} (bid). Rule says sell now.",
-                          title=f"SELL: {p['ticker']} hit {STOP:.0%}", priority=PRI_URGENT,
+                          title=f"SELL: {p['ticker']} hit {stop:.0%}", priority=PRI_URGENT,
                           tags="rotating_light")
                     p["stop_last"] = n.isoformat(timespec="seconds")
                     changed = True
-            elif p["stop_last"] and pct > STOP:
+            elif p["stop_last"] and pct > stop:
                 p["stop_last"] = None
                 changed = True
             soft = p.setdefault("soft", [])
             if pct >= SOFT and "up" not in soft:
-                if pct < TARGETS[0]:
+                if pct < targets[0] and not swing:
                     alert(f"{p['id']} is {pct:+.0%} (+${usd:,.0f})\n{p['entry']:.2f} -> {mid:.2f} (bid). "
                           "Maybe time to sell, or at least decide where you'd get out.",
                           title=f"{p['ticker']} up {pct:.0%}", priority=PRI_ACTION, tags="chart_with_upwards_trend")
@@ -1459,17 +1488,17 @@ def check_positions():
             elif pct < SOFT / 2 and "up" in soft:
                 soft.remove("up")
                 changed = True
-            if pct <= -SOFT and "down" not in soft:
-                if pct > STOP:
+            if pct <= -soft_dn and "down" not in soft:
+                if pct > stop:
                     alert(f"{p['id']} is {pct:+.0%} (-${abs(usd):,.0f})\n{p['entry']:.2f} -> {mid:.2f} (bid). "
                           "Halfway to your stop. Maybe time to sell. Hold only if you would buy it again today.",
                           title=f"{p['ticker']} down {abs(pct):.0%}", priority=PRI_ACTION, tags="warning")
                 soft.append("down")
                 changed = True
-            elif pct > -SOFT / 2 and "down" in soft:
+            elif pct > -soft_dn / 2 and "down" in soft:
                 soft.remove("down")
                 changed = True
-            new_hits = [tgt for tgt in TARGETS if pct >= tgt and tgt not in p["targets_hit"]]
+            new_hits = [tgt for tgt in targets if pct >= tgt and tgt not in p["targets_hit"]]
             if new_hits:
                 top = max(new_hits)
                 alert(f"{p['id']} is {pct:+.0%} (+${usd:,.0f})\n{p['entry']:.2f} -> {mid:.2f} (bid). " +
@@ -1836,6 +1865,18 @@ def check_text(text):
                 lines.append("- INFO: " + _el)
     except Exception as e:
         print(f"[check] er info: {e}")
+    # check news v1
+    try:
+        _nr = [r for r in _outcomes() if r["ticker"] == tk][-3:][::-1]
+        if _nr:
+            lines.append("NEWS:")
+            for r in _nr:
+                _mk = {"bullish": "GOOD", "bearish": "BAD"}.get(r["direction"], "neutral")
+                lines.append(f"  {_nd(r)} {_mk}: {r['title'][:90]}")
+        else:
+            lines.append(f"NEWS: nothing logged for {tk} lately.")
+    except Exception as e:
+        print(f"[check] news: {e}")
     lines.append("Nothing was logged. After you buy, paste the order with its 'Filled at' line.")
     return "\n".join(lines)
 
@@ -1985,8 +2026,8 @@ def _phone_actions(tk):
     if not base:
         return None
     return "; ".join([f"http, Check 1, {base}/trade, method=POST, body=check {tk} 1",
-                      f"http, Check 2, {base}/trade, method=POST, body=check {tk} 2",
-                      f"http, Live, {base}/trade, method=POST, body=live {tk}"])
+                      f"http, Buy, {base}/trade, method=POST, body=buy {tk}, clear=true",
+                      f"http, Skip, {base}/trade, method=POST, body=skip {tk}, clear=true"])
 
 
 # dip hold note v1
@@ -2141,6 +2182,123 @@ def cmd_restricted(words):
     reply(restriction_text() or "Restriction cleared.")
 
 
+# decide v1
+DEC_FILE = os.path.join(HERE, "decisions.csv")
+
+
+def _latest_signal(tk=None):
+    try:
+        with open(os.path.join(HERE, "buy_signals.json")) as f:
+            sigs = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    for sg in reversed(sigs):
+        if tk and sg.get("ticker") != tk:
+            continue
+        try:
+            if (now() - datetime.fromisoformat(sg["time"])).total_seconds() > 24 * 3600:
+                continue
+        except Exception:
+            continue
+        return sg
+    return None
+
+
+def _decide(decision, words):
+    """Log 'I'm buying this' / 'skip this' for the latest alert (or the ticker named)."""
+    side, tk = None, None
+    for w in words:
+        wl = w.lower()
+        if wl in ("put", "puts"):
+            side = "P"
+        elif wl in ("call", "calls"):
+            side = "C"
+        elif re.fullmatch(r"[A-Za-z.]{1,6}", w):
+            tk = w.upper()
+    sg = _latest_signal(tk)
+    if tk is None:
+        if not sg:
+            raise ValueError("no alert in the last 24 hours to answer. Name it: skip LLY")
+        tk = sg["ticker"]
+    if side is None:
+        side = (sg or {}).get("side", "C")
+    price = None
+    try:
+        import alpaca_live
+        price = alpaca_live.prices([tk]).get(tk)
+    except Exception as e:
+        print(f"[decide] price: {e}")
+    new = not os.path.exists(DEC_FILE)
+    with open(DEC_FILE, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["time", "decision", "ticker", "side", "stock_price"])
+        w.writerow([now().isoformat(timespec="seconds"), decision, tk, side, f"{price:.2f}" if price else ""])
+    return tk, side, price
+
+
+def cmd_skip(words):
+    tk, side, price = _decide("skip", words)
+    word = "put" if side == "P" else "call"
+    px = f" (stock ${price:,.2f})" if price else ""
+    reply(f"SKIPPED {tk} {word}{px}.\nI'll track what the stock does after this, so you can see what you passed on. Type 'decisions' any time.")
+
+
+def cmd_buy_decision(words):
+    # buy shows picks v2
+    tk, side, price = _decide("buy", words)
+    word = "put" if side == "P" else "call"
+    px = f" (stock ${price:,.2f})" if price else ""
+    reply(f"BUY noted: {tk} {word}{px}. Here are the suggested contracts and prices:")
+    cmd_pick([tk] + (["put"] if side == "P" else []))
+    reply(f"Want a last look before ordering? check {tk} 1" + (" put" if side == "P" else "")
+          + "\nWhen it fills, paste the order text with the 'Filled at' line and I'll log it.")
+
+
+def cmd_decisions(words):
+    import alpaca_live
+    if not os.path.exists(DEC_FILE):
+        reply("No decisions yet. Tap Buy or Skip on an alert, or type skip LLY / buy LLY.")
+        return
+    cutoff = now() - timedelta(days=int(words[0]) if words and words[0].isdigit() else 14)
+    rows = []
+    with open(DEC_FILE) as f:
+        for r in csv.DictReader(f):
+            try:
+                if datetime.fromisoformat(r["time"]) >= cutoff:
+                    rows.append(r)
+            except Exception:
+                pass
+    if not rows:
+        reply("No decisions in that window.")
+        return
+    try:
+        cur = alpaca_live.prices(sorted({r["ticker"] for r in rows}))
+    except Exception as e:
+        print(f"[decisions] {e}")
+        cur = {}
+    out, agg = [], {"buy": [], "skip": []}
+    for r in rows:
+        d = datetime.fromisoformat(r["time"])
+        sign = 1 if r["side"] == "C" else -1
+        try:
+            p0, p1 = float(r["stock_price"]), cur.get(r["ticker"])
+            mv = sign * (p1 / p0 - 1) if p1 else None
+        except (ValueError, TypeError):
+            mv = None
+        if mv is not None:
+            agg[r["decision"]].append(mv)
+        out.append(f"{d.strftime('%a %-m/%-d')} {r['decision'].upper():4} {r['ticker']} {'put' if sign < 0 else 'call'}  "
+                   + (f"{mv:+.1%}" if mv is not None else "n/a"))
+    summ = []
+    for k in ("buy", "skip"):
+        if agg[k]:
+            summ.append(f"{k}: {len(agg[k])}, avg {sum(agg[k]) / len(agg[k]):+.1%}, "
+                        f"{sum(1 for x in agg[k] if x > 0)} went your way")
+    reply("\n".join(out[-15:]) + "\n\n" + "\n".join(summ)
+          + "\n(Stock move in your direction since the alert, not option P/L. Real results are in 'stats'.)")
+
+
 def check_expiries():
     today = now().date()
     with lock:
@@ -2167,7 +2325,7 @@ def morning_brief():
     if md["early"]:
         alert(f"Early close today: market closes at {md['close'].strftime('%-I:%M %p')} CT. "
               f"Plan to be out before then.", title="Short day", priority=PRI_INFO, tags="hourglass")
-    if n.weekday() in (0, 1):
+    if n.weekday() == 0:
         alert(f"Trading opens at 11:00. No new trades before then.{held}",
               title=f"{n:%A}", priority=PRI_INFO, tags="clock11")
         return
@@ -2225,7 +2383,7 @@ def friday_flat():
         lines = []
         for p in held:
             d = date.fromisoformat(p["hold_until"])
-            lines.append(f"{p['id']} x{p['qty']} - dip trade, hold until at least {d.strftime('%a')} {d.month}/{d.day}")
+            lines.append(f"{p['id']} x{p['qty']} - {'swing' if p.get('swing') else 'dip'} trade, hold until at least {d.strftime('%a')} {d.month}/{d.day}")
         alert("Holding over the weekend on purpose:\n" + "\n".join(lines) +
               "\nThe get-flat rule is skipped for these. Stop and target alerts still run.",
               title="Holding over the weekend", priority=PRI_INFO, tags="information_source")
@@ -2233,11 +2391,26 @@ def friday_flat():
 
 def hold_due():
     today = now().date().isoformat()
-    due = [p for p in load_positions() if p.get("hold_until") == today]
+    with lock:
+        pos = load_positions()
+        due = [p for p in pos if p.get("hold_until") == today]
+        swings = [p for p in due if p.get("swing")]
+        for p in swings:
+            p["swing"] = False
+            p.pop("stop", None)
+            p.pop("targets", None)
+            p["targets_hit"] = []
+        if swings:
+            save_positions(pos)
     if due:
-        alert("The 3-day hold is up today:\n" + "\n".join(p["id"] + f" x{p['qty']}" for p in due) +
-              "\nYou can sell any time now. The normal rules (stop, targets, flat by Friday) apply again.",
-              title="Dip hold is over", priority=PRI_ACTION, tags="alarm_clock")
+        if swings:
+            alert("Last day of the swing. Plan to sell by the close today:\n" + "\n".join(p["id"] + f" x{p['qty']}" for p in due) +
+                  "\nThe normal rules are back on (stop -20%, +20% and +40% alerts, flat by Friday).",
+                  title="Swing ends today", priority=PRI_ACTION, tags="alarm_clock")
+        else:
+            alert("The 3-day hold is up today:\n" + "\n".join(p["id"] + f" x{p['qty']}" for p in due) +
+                  "\nYou can sell any time now. The normal rules (stop, targets, flat by Friday) apply again.",
+                  title="Dip hold is over", priority=PRI_ACTION, tags="alarm_clock")
 
 
 def cmd_hold(words):
@@ -2258,6 +2431,127 @@ def cmd_hold(words):
         reply(f"{tk} is already past 3 trading days, so the normal rules apply.")
     else:
         reply(f"{tk}: holding until at least {d.strftime('%a')} {d.month}/{d.day}. The Friday get-flat reminder is skipped until then.")
+
+
+# swing v1
+SWING_STOP = -0.30
+SWING_TARGETS = [0.40]
+SWING_LOG = os.path.join(HERE, "swing_log.csv")
+
+
+def _swing_actions(tk):
+    base = os.environ.get("NTFY_PHONE_URL", "").strip().rstrip("/")
+    if not base:
+        try:
+            import subprocess
+            ip = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
+            base = f"http://{ip[0]}:2586" if ip else ""
+        except Exception:
+            base = ""
+    if not base:
+        return None
+    return f"http, Swing, {base}/trade, method=POST, body=swing {tk}, clear=true"
+
+
+# swing default v1
+SWING_DEFAULT = True      # a new position bought after a bot signal (Mon-Thu) starts as a swing; the "Same day" button undoes it
+SAMEDAY_LOG = os.path.join(HERE, "sameday_log.csv")
+
+
+def _auto_swing(p, n):
+    """Caller holds the lock and saves positions."""
+    opened = datetime.fromisoformat(p["opened"]).date()
+    p["swing"] = True
+    p["stop"] = SWING_STOP
+    p["targets"] = SWING_TARGETS
+    p["targets_hit"] = []
+    p["stop_last"] = None
+    p["hold_until"] = _add_trading_days(opened, 1).isoformat()
+    try:
+        new = not os.path.exists(SWING_LOG)
+        with open(SWING_LOG, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["time", "contract", "qty", "entry"])
+            w.writerow([n.isoformat(timespec="seconds"), p["id"], p["qty"], p["entry"]])
+    except Exception as e:
+        print(f"[swing log] {e}")
+
+
+def _sameday_actions(tk):
+    a = _swing_actions(tk)
+    return a.replace("Swing,", "Same day,").replace(f"body=swing {tk}", f"body=sameday {tk}") if a else None
+
+
+def cmd_sameday(words):
+    if not words:
+        raise ValueError("like: sameday LLY   (go back to the normal same-day rules for that position)")
+    tk = words[0].upper()
+    n = now()
+    with lock:
+        pos = load_positions()
+        hits = [p for p in pos if p["ticker"] == tk and p.get("swing")]
+        if not hits:
+            raise ValueError(f"no swing {tk} position")
+        for p in hits:
+            p["swing"] = False
+            for k in ("stop", "targets", "hold_until"):
+                p.pop(k, None)
+            p["targets_hit"] = []
+            p["stop_last"] = None
+        save_positions(pos)
+        try:
+            new = not os.path.exists(SAMEDAY_LOG)
+            with open(SAMEDAY_LOG, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["time", "contract", "qty", "entry"])
+                for p in hits:
+                    w.writerow([n.isoformat(timespec="seconds"), p["id"], p["qty"], p["entry"]])
+        except Exception as e:
+            print(f"[sameday log] {e}")
+    reply(f"SAME DAY: {', '.join(p['id'] for p in hits)}\n"
+          f"Back to the normal rules: stop alert {STOP:.0%}, +20% prompts, flat by Friday.")
+
+
+def cmd_swing(words):
+    if not words:
+        raise ValueError("like: swing LLY   (hold that position to the next close with a -30% stop)")
+    tk = words[0].upper()
+    n = now()
+    if n.weekday() == 4:
+        reply("Not on a Friday: a swing would carry the option over the weekend (two extra days of time decay). "
+              "Plan to be flat today, or start a swing on Monday to Thursday.")
+        return
+    with lock:
+        pos = load_positions()
+        hits = [p for p in pos if p["ticker"] == tk]
+        if not hits:
+            raise ValueError(f"no open {tk} position")
+        for p in hits:
+            opened = datetime.fromisoformat(p["opened"]).date()
+            p["swing"] = True
+            p["stop"] = SWING_STOP
+            p["targets"] = SWING_TARGETS
+            p["targets_hit"] = []
+            p["stop_last"] = None
+            p["hold_until"] = _add_trading_days(opened, 1).isoformat()
+        save_positions(pos)
+        try:
+            new = not os.path.exists(SWING_LOG)
+            with open(SWING_LOG, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["time", "contract", "qty", "entry"])
+                for p in hits:
+                    w.writerow([n.isoformat(timespec="seconds"), p["id"], p["qty"], p["entry"]])
+        except Exception as e:
+            print(f"[swing log] {e}")
+    d = date.fromisoformat(hits[0]["hold_until"])
+    reply(f"SWING: {', '.join(p['id'] for p in hits)}\n"
+          f"Holding to the close of {d.strftime('%a')} {d.month}/{d.day}. Stop alert at {SWING_STOP:.0%} (wider than your usual -20%), "
+          f"no +20% sell prompt, the +40% alert is still on. The Friday get-flat reminder is skipped until then, "
+          f"and I'll remind you on the morning of the last day.")
 
 
 def flat_check(n):
